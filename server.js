@@ -128,6 +128,12 @@ app.post("/api/analyze", async (req, res) => {
     return res.status(400).json({ error: "Missing filename or base64PDF" });
   }
 
+  // Reject anything that isn't a PDF — ignores email signature images, logos etc.
+  if (!filename.toLowerCase().endsWith(".pdf")) {
+    console.log(`[${new Date().toISOString()}] Skipped non-PDF: ${filename}`);
+    return res.status(200).json({ skipped: true, reason: "Not a PDF file" });
+  }
+
   try {
     console.log(`[${new Date().toISOString()}] Analyzing: ${filename}`);
     const analysis = await analyzeWithClaude(base64PDF, filename);
