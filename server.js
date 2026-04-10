@@ -1,17 +1,3 @@
-/**
- * Brazen Head Restaurant Intelligence — Backend API
- * 
- * Receives PDF attachments from Power Automate (via HTTP POST),
- * analyzes them with Claude, and stores results for the dashboard.
- * 
- * Deploy to: Railway / Render / Azure App Service / any Node host
- * 
- * Setup:
- *   npm install
- *   Set env vars: ANTHROPIC_API_KEY, WEBHOOK_SECRET
- *   node server.js
- */
-
 const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
@@ -26,7 +12,6 @@ const PORT = process.env.PORT || 3001;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "change-this-secret";
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
-// ─── Load / Save reports ────────────────────────────────────────────────────
 function loadReports() {
   if (!fs.existsSync(DATA_FILE)) return [];
   try { return JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); }
@@ -35,11 +20,26 @@ function loadReports() {
 
 function saveReport(report) {
   const reports = loadReports();
-  reports.unshift(report); // newest first
-  fs.writeFileSync(DATA_FILE, JSON.stringify(reports.slice(0, 52), null, 2)); // keep 1yr
+  reports.unshift(report);
+  fs.writeFileSync(DATA_FILE, JSON.stringify(reports.slice(0, 52), null, 2));
 }
 
-// ─── Claude Analysis ─────────────────────────────────────────────────────────
+function toCleanBase64(input) {
+  if (!input) return null;
+  // If it's already a string, clean it up
+  if (typeof input === "string") {
+    // Remove data URI prefix if present (e.g. "data:application/pdf;base64,")
+    const cleaned = input.replace(/^data:[^;]+;base64,/, "").trim();
+    // Remove any whitespace/newlines that corrupt base64
+    return cleaned.replace(/\s/g, "");
+  }
+  // If it's a buffer/binary, convert to base64
+  if (Buffer.isBuffer(input)) {
+    return input.toString("base64");
+  }
+  return null;
+}
+
 const SYSTEM_PROMPT = `You are a seasoned restaurant operations consultant with 20+ years experience. 
 You receive weekly KPI reports from restaurant locations and provide brutal, specific analysis.
 
@@ -47,7 +47,6 @@ Respond ONLY with a raw JSON object (no markdown, no backticks):
 {
   "location": "restaurant name",
   "reportWeek": "period/week label",
-  "receivedAt": "ISO timestamp",
   "overallScore": 72,
   "overallVerdict": "2-3 sentence honest assessment",
   "kpis": [
@@ -112,32 +111,40 @@ async function analyzeWithClaude(base64PDF, filename) {
   return JSON.parse(raw.slice(start, end + 1));
 }
 
-// ─── Routes ──────────────────────────────────────────────────────────────────
-
-// Power Automate calls this when a new report email arrives
 app.post("/api/analyze", async (req, res) => {
-  // Simple secret check — Power Automate sends this in the header
   const secret = req.headers["x-webhook-secret"];
   if (secret !== WEBHOOK_SECRET) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  const { filename, base64PDF, emailSubject, emailFrom, emailDate } = req.body;
+  const { filename, base64PDF, contentBytes, emailSubject, emailFrom, emailDate } = req.body;
 
-  if (!base64PDF || !filename) {
-    return res.status(400).json({ error: "Missing filename or base64PDF" });
+  if (!filename) {
+    return res.status(400).json({ error: "Missing filename" });
   }
 
-  // Reject anything that isn't a PDF — ignores email signature images, logos etc.
+  // Reject non-PDFs silently
   if (!filename.toLowerCase().endsWith(".pdf")) {
     console.log(`[${new Date().toISOString()}] Skipped non-PDF: ${filename}`);
     return res.status(200).json({ skipped: true, reason: "Not a PDF file" });
   }
 
-  try {
-    console.log(`[${new Date().toISOString()}] Analyzing: ${filename}`);
-    const analysis = await analyzeWithClaude(base64PDF, filename);
+  // Accept either base64PDF or contentBytes field
+  const rawData = base64PDF || contentBytes;
+  if (!rawData) {
+    return res.status(400).json({ error: "Missing PDF data" });
+  }
 
+  // Clean and normalize the base64 data
+  const cleanBase64 = toCleanBase64(rawData);
+  if (!cleanBase64) {
+    return res.status(400).json({ error: "Could not process PDF data" });
+  }
+
+  console.log(`[${new Date().toISOString()}] Analyzing: ${filename} (${cleanBase64.length} base64 chars)`);
+
+  try {
+    const analysis = await analyzeWithClaude(cleanBase64, filename);
     const report = {
       ...analysis,
       id: `report_${Date.now()}`,
@@ -157,17 +164,15 @@ app.post("/api/analyze", async (req, res) => {
   }
 });
 
-// Dashboard fetches all reports
 app.get("/api/reports", (req, res) => {
   res.json(loadReports());
 });
 
-// Health check
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", reports: loadReports().length });
 });
 
 app.listen(PORT, () => {
   console.log(`Restaurant Intelligence API running on port ${PORT}`);
-  if (!ANTHROPIC_API_KEY) console.warn("⚠️  ANTHROPIC_API_KEY not set!");
+  if (!ANTHROPIC_API_KEY) console.warn("WARNING: ANTHROPIC_API_KEY not set!");
 });
