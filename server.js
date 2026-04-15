@@ -25,48 +25,35 @@ function saveReport(report) {
   fs.writeFileSync(DATA_FILE, JSON.stringify(reports.slice(0, 52), null, 2));
 }
 
-// Pure Node.js ZIP parser — no external tools needed
-// ZIP format: local file headers followed by file data
 function parseZipBuffer(buffer) {
   const files = {};
   let offset = 0;
-
   while (offset < buffer.length - 4) {
-    // Local file header signature: 0x04034b50
-    if (buffer.readUInt32LE(offset) !== 0x04034b50) {
-      offset++;
-      continue;
-    }
-
+    if (buffer.readUInt32LE(offset) !== 0x04034b50) { offset++; continue; }
     const compression = buffer.readUInt16LE(offset + 8);
     const compressedSize = buffer.readUInt32LE(offset + 18);
-    const uncompressedSize = buffer.readUInt32LE(offset + 22);
     const fileNameLength = buffer.readUInt16LE(offset + 26);
     const extraFieldLength = buffer.readUInt16LE(offset + 28);
     const fileName = buffer.slice(offset + 30, offset + 30 + fileNameLength).toString("utf8");
     const dataOffset = offset + 30 + fileNameLength + extraFieldLength;
     const compressedData = buffer.slice(dataOffset, dataOffset + compressedSize);
-
     try {
       if (compression === 0) {
-        // No compression
         files[fileName] = compressedData;
       } else if (compression === 8) {
-        // Deflate
         files[fileName] = zlib.inflateRawSync(compressedData);
       }
-    } catch(e) {
-      // Skip files we can't decompress
-    }
-
+    } catch(e) {}
     offset = dataOffset + compressedSize;
   }
-
   return files;
 }
 
 function parseXLSX(buffer) {
   const files = parseZipBuffer(buffer);
+
+  // Log all files found in the xlsx for debugging
+  console.log(`[XLSX files found]: ${Object.keys(files).join(", ")}`);
 
   // Get shared strings
   let sharedStrings = [];
@@ -77,12 +64,20 @@ function parseXLSX(buffer) {
     sharedStrings = matches.map(m => m.replace(/<[^>]+>/g, "").trim());
   }
 
-  // Get sheet1
-  const sheetBuffer = files["xl/worksheets/sheet1.xml"];
-  if (!sheetBuffer) throw new Error("No sheet1.xml found in xlsx");
-  const sheetXml = sheetBuffer.toString("utf8");
+  // Find any sheet file — try sheet1 first, then any worksheet
+  let sheetBuffer = files["xl/worksheets/sheet1.xml"];
+  if (!sheetBuffer) {
+    // Try to find any worksheet
+    const sheetKey = Object.keys(files).find(k => k.startsWith("xl/worksheets/") && k.endsWith(".xml"));
+    if (sheetKey) {
+      console.log(`[XLSX] Using sheet: ${sheetKey}`);
+      sheetBuffer = files[sheetKey];
+    }
+  }
 
-  // Extract rows
+  if (!sheetBuffer) throw new Error("No worksheet found in xlsx");
+
+  const sheetXml = sheetBuffer.toString("utf8");
   const rows = sheetXml.match(/<row[^>]*>[\s\S]*?<\/row>/g) || [];
   const result = [];
 
