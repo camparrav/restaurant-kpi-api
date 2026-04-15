@@ -1,7 +1,7 @@
 {
   "name": "restaurant-intelligence-api",
   "version": "1.0.0",
-  "description": "Restaurant KPI analysis backend — receives PDFs from Power Automate, analyzes with Claude",
+  "description": "Restaurant KPI analysis backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
