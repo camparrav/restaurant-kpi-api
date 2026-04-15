@@ -25,64 +25,87 @@ function saveReport(report) {
   fs.writeFileSync(DATA_FILE, JSON.stringify(reports.slice(0, 52), null, 2));
 }
 
-// Parse xlsx using only Node.js built-ins
-// xlsx is a zip file — we unzip it and extract XML text
-async function parseXLSX(buffer) {
-  // Write buffer to temp file, unzip it, read the sheet XML
-  const tmpDir = path.join("/tmp", `xlsx_${Date.now()}`);
-  const tmpFile = tmpDir + ".xlsx";
-  
-  try {
-    fs.writeFileSync(tmpFile, buffer);
-    fs.mkdirSync(tmpDir, { recursive: true });
-    
-    // Use Node's child_process to unzip
-    const { execSync } = require("child_process");
-    execSync(`unzip -o "${tmpFile}" -d "${tmpDir}"`, { timeout: 10000 });
-    
-    // Read shared strings
-    let sharedStrings = [];
-    const ssPath = path.join(tmpDir, "xl", "sharedStrings.xml");
-    if (fs.existsSync(ssPath)) {
-      const xml = fs.readFileSync(ssPath, "utf8");
-      const matches = xml.match(/<t[^>]*>([^<]*)<\/t>/g) || [];
-      sharedStrings = matches.map(m => m.replace(/<[^>]+>/g, "").trim());
+// Pure Node.js ZIP parser — no external tools needed
+// ZIP format: local file headers followed by file data
+function parseZipBuffer(buffer) {
+  const files = {};
+  let offset = 0;
+
+  while (offset < buffer.length - 4) {
+    // Local file header signature: 0x04034b50
+    if (buffer.readUInt32LE(offset) !== 0x04034b50) {
+      offset++;
+      continue;
     }
-    
-    // Read sheet1
-    const sheetPath = path.join(tmpDir, "xl", "worksheets", "sheet1.xml");
-    if (!fs.existsSync(sheetPath)) throw new Error("No sheet1.xml found");
-    const sheetXml = fs.readFileSync(sheetPath, "utf8");
-    
-    // Extract rows
-    const rows = sheetXml.match(/<row[^>]*>[\s\S]*?<\/row>/g) || [];
-    const result = [];
-    
-    for (const row of rows) {
-      const cells = row.match(/<c[^>]*>[\s\S]*?<\/c>/g) || [];
-      const rowData = [];
-      for (const cell of cells) {
-        const typeMatch = cell.match(/t="([^"]*)"/);
-        const valueMatch = cell.match(/<v>([^<]*)<\/v>/);
-        const type = typeMatch ? typeMatch[1] : "";
-        const rawValue = valueMatch ? valueMatch[1] : "";
-        if (type === "s") {
-          rowData.push(sharedStrings[parseInt(rawValue)] || "");
-        } else {
-          rowData.push(rawValue);
-        }
+
+    const compression = buffer.readUInt16LE(offset + 8);
+    const compressedSize = buffer.readUInt32LE(offset + 18);
+    const uncompressedSize = buffer.readUInt32LE(offset + 22);
+    const fileNameLength = buffer.readUInt16LE(offset + 26);
+    const extraFieldLength = buffer.readUInt16LE(offset + 28);
+    const fileName = buffer.slice(offset + 30, offset + 30 + fileNameLength).toString("utf8");
+    const dataOffset = offset + 30 + fileNameLength + extraFieldLength;
+    const compressedData = buffer.slice(dataOffset, dataOffset + compressedSize);
+
+    try {
+      if (compression === 0) {
+        // No compression
+        files[fileName] = compressedData;
+      } else if (compression === 8) {
+        // Deflate
+        files[fileName] = zlib.inflateRawSync(compressedData);
       }
-      if (rowData.some(v => v !== "")) {
-        result.push(rowData.join(" | "));
-      }
+    } catch(e) {
+      // Skip files we can't decompress
     }
-    
-    return result.join("\n");
-  } finally {
-    // Cleanup temp files
-    try { fs.rmSync(tmpFile, { force: true }); } catch(e) {}
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {}
+
+    offset = dataOffset + compressedSize;
   }
+
+  return files;
+}
+
+function parseXLSX(buffer) {
+  const files = parseZipBuffer(buffer);
+
+  // Get shared strings
+  let sharedStrings = [];
+  const ssBuffer = files["xl/sharedStrings.xml"];
+  if (ssBuffer) {
+    const xml = ssBuffer.toString("utf8");
+    const matches = xml.match(/<t[^>]*>([^<]*)<\/t>/g) || [];
+    sharedStrings = matches.map(m => m.replace(/<[^>]+>/g, "").trim());
+  }
+
+  // Get sheet1
+  const sheetBuffer = files["xl/worksheets/sheet1.xml"];
+  if (!sheetBuffer) throw new Error("No sheet1.xml found in xlsx");
+  const sheetXml = sheetBuffer.toString("utf8");
+
+  // Extract rows
+  const rows = sheetXml.match(/<row[^>]*>[\s\S]*?<\/row>/g) || [];
+  const result = [];
+
+  for (const row of rows) {
+    const cells = row.match(/<c[^>]*>[\s\S]*?<\/c>/g) || [];
+    const rowData = [];
+    for (const cell of cells) {
+      const typeMatch = cell.match(/t="([^"]*)"/);
+      const valueMatch = cell.match(/<v>([^<]*)<\/v>/);
+      const type = typeMatch ? typeMatch[1] : "";
+      const rawValue = valueMatch ? valueMatch[1] : "";
+      if (type === "s") {
+        rowData.push(sharedStrings[parseInt(rawValue)] || "");
+      } else {
+        rowData.push(rawValue);
+      }
+    }
+    if (rowData.some(v => v !== "")) {
+      result.push(rowData.join(" | "));
+    }
+  }
+
+  return result.join("\n");
 }
 
 const SYSTEM_PROMPT = `You are a seasoned restaurant operations consultant with 20+ years experience. 
@@ -187,7 +210,7 @@ app.post("/api/analyze", async (req, res) => {
     } else {
       const buffer = Buffer.from(base64PDF, "base64");
       console.log(`[${new Date().toISOString()}] XLSX buffer: ${buffer.length} bytes`);
-      fileContent = await parseXLSX(buffer);
+      fileContent = parseXLSX(buffer);
       console.log(`[${new Date().toISOString()}] XLSX parsed: ${fileContent.length} chars`);
     }
 
