@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
+const zlib = require("zlib");
 
 const app = express();
 app.use(cors());
@@ -22,6 +23,66 @@ function saveReport(report) {
   const reports = loadReports();
   reports.unshift(report);
   fs.writeFileSync(DATA_FILE, JSON.stringify(reports.slice(0, 52), null, 2));
+}
+
+// Parse xlsx using only Node.js built-ins
+// xlsx is a zip file — we unzip it and extract XML text
+async function parseXLSX(buffer) {
+  // Write buffer to temp file, unzip it, read the sheet XML
+  const tmpDir = path.join("/tmp", `xlsx_${Date.now()}`);
+  const tmpFile = tmpDir + ".xlsx";
+  
+  try {
+    fs.writeFileSync(tmpFile, buffer);
+    fs.mkdirSync(tmpDir, { recursive: true });
+    
+    // Use Node's child_process to unzip
+    const { execSync } = require("child_process");
+    execSync(`unzip -o "${tmpFile}" -d "${tmpDir}"`, { timeout: 10000 });
+    
+    // Read shared strings
+    let sharedStrings = [];
+    const ssPath = path.join(tmpDir, "xl", "sharedStrings.xml");
+    if (fs.existsSync(ssPath)) {
+      const xml = fs.readFileSync(ssPath, "utf8");
+      const matches = xml.match(/<t[^>]*>([^<]*)<\/t>/g) || [];
+      sharedStrings = matches.map(m => m.replace(/<[^>]+>/g, "").trim());
+    }
+    
+    // Read sheet1
+    const sheetPath = path.join(tmpDir, "xl", "worksheets", "sheet1.xml");
+    if (!fs.existsSync(sheetPath)) throw new Error("No sheet1.xml found");
+    const sheetXml = fs.readFileSync(sheetPath, "utf8");
+    
+    // Extract rows
+    const rows = sheetXml.match(/<row[^>]*>[\s\S]*?<\/row>/g) || [];
+    const result = [];
+    
+    for (const row of rows) {
+      const cells = row.match(/<c[^>]*>[\s\S]*?<\/c>/g) || [];
+      const rowData = [];
+      for (const cell of cells) {
+        const typeMatch = cell.match(/t="([^"]*)"/);
+        const valueMatch = cell.match(/<v>([^<]*)<\/v>/);
+        const type = typeMatch ? typeMatch[1] : "";
+        const rawValue = valueMatch ? valueMatch[1] : "";
+        if (type === "s") {
+          rowData.push(sharedStrings[parseInt(rawValue)] || "");
+        } else {
+          rowData.push(rawValue);
+        }
+      }
+      if (rowData.some(v => v !== "")) {
+        result.push(rowData.join(" | "));
+      }
+    }
+    
+    return result.join("\n");
+  } finally {
+    // Cleanup temp files
+    try { fs.rmSync(tmpFile, { force: true }); } catch(e) {}
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch(e) {}
+  }
 }
 
 const SYSTEM_PROMPT = `You are a seasoned restaurant operations consultant with 20+ years experience. 
@@ -60,62 +121,7 @@ Respond ONLY with a raw JSON object (no markdown, no backticks):
 Use real benchmarks: food cost 28-32%, labour 30-35%, beverage 22-28%, prime cost <65%, promos <5%.
 Be ruthlessly specific. Name exact numbers, exact people, exact actions for the next 7 days only.`;
 
-async function parseXLSX(buffer) {
-  // Convert xlsx to CSV-like text using raw XML extraction
-  // xlsx files are zip files containing XML — we extract the shared strings and sheet data
-  const JSZip = require("jszip");
-  const zip = await JSZip.loadAsync(buffer);
-
-  // Get shared strings (the text values in the spreadsheet)
-  let sharedStrings = [];
-  const sharedStringsFile = zip.file("xl/sharedStrings.xml");
-  if (sharedStringsFile) {
-    const xml = await sharedStringsFile.async("string");
-    const matches = xml.match(/<t[^>]*>([^<]*)<\/t>/g) || [];
-    sharedStrings = matches.map(m => m.replace(/<[^>]+>/g, ""));
-  }
-
-  // Get the first sheet
-  const sheetFile = zip.file("xl/worksheets/sheet1.xml");
-  if (!sheetFile) throw new Error("No sheet found in xlsx");
-  const sheetXml = await sheetFile.async("string");
-
-  // Extract rows and cells
-  const rows = sheetXml.match(/<row[^>]*>.*?<\/row>/gs) || [];
-  const result = [];
-
-  for (const row of rows) {
-    const cells = row.match(/<c[^>]*>.*?<\/c>/gs) || [];
-    const rowData = [];
-    for (const cell of cells) {
-      const typeMatch = cell.match(/t="([^"]*)"/);
-      const valueMatch = cell.match(/<v>([^<]*)<\/v>/);
-      const type = typeMatch ? typeMatch[1] : "";
-      const rawValue = valueMatch ? valueMatch[1] : "";
-
-      if (type === "s") {
-        // Shared string reference
-        rowData.push(sharedStrings[parseInt(rawValue)] || "");
-      } else {
-        rowData.push(rawValue);
-      }
-    }
-    if (rowData.some(v => v !== "")) {
-      result.push(rowData.join(", "));
-    }
-  }
-
-  return result.join("\n");
-}
-
 async function analyzeWithClaude(fileContent, filename) {
-  const messageContent = [
-    { 
-      type: "text", 
-      text: `Here is the restaurant KPI report data from ${filename}:\n\n${fileContent}\n\nAnalyze every metric. Extract all KPIs, benchmark against industry standards, identify top issues, and give hard 7-day recommendations. Return ONLY raw JSON.` 
-    }
-  ];
-
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -127,7 +133,13 @@ async function analyzeWithClaude(fileContent, filename) {
       model: "claude-sonnet-4-20250514",
       max_tokens: 4000,
       system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: messageContent }]
+      messages: [{
+        role: "user",
+        content: [{
+          type: "text",
+          text: `Here is the restaurant KPI report data from ${filename}:\n\n${fileContent}\n\nAnalyze every metric. Extract all KPIs, benchmark against industry standards, identify top issues, and give hard 7-day recommendations. Return ONLY raw JSON.`
+        }]
+      }]
     })
   });
 
@@ -158,7 +170,6 @@ app.post("/api/analyze", async (req, res) => {
   const isXLSX = lname.endsWith(".xlsx") || lname.endsWith(".xls");
   const isCSV  = lname.endsWith(".csv");
 
-  // Skip anything that isn't xlsx or csv
   if (!isXLSX && !isCSV) {
     console.log(`[${new Date().toISOString()}] Skipped: ${filename}`);
     return res.status(200).json({ skipped: true });
@@ -168,14 +179,12 @@ app.post("/api/analyze", async (req, res) => {
 
   try {
     console.log(`[${new Date().toISOString()}] Processing: ${filename}`);
-
     let fileContent;
 
     if (isCSV) {
       fileContent = Buffer.from(base64PDF, "base64").toString("utf8");
       console.log(`[${new Date().toISOString()}] CSV decoded: ${fileContent.length} chars`);
     } else {
-      // XLSX — decode base64 to buffer then parse
       const buffer = Buffer.from(base64PDF, "base64");
       console.log(`[${new Date().toISOString()}] XLSX buffer: ${buffer.length} bytes`);
       fileContent = await parseXLSX(buffer);
