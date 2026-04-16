@@ -232,9 +232,38 @@ app.post("/api/analyze", async (req, res) => {
 });
 
 app.get("/api/reports", (req, res) => res.json(loadReports()));
-app.get("/api/health", (req, res) => res.json({ status: "ok", reports: loadReports().length }));
 
-app.listen(PORT, () => {
-  console.log(`Restaurant Intelligence API running on port ${PORT}`);
-  if (!ANTHROPIC_API_KEY) console.warn("WARNING: ANTHROPIC_API_KEY not set!");
+// Proxy for Claude API — used by the Pogue Mahone dashboard AI brief
+// so the browser doesn't hit CORS issues calling api.anthropic.com directly
+app.post("/api/brief", async (req, res) => {
+  if (!ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured" });
+  }
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: req.body.model || "claude-sonnet-4-20250514",
+        max_tokens: req.body.max_tokens || 1000,
+        messages: req.body.messages
+      })
+    });
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      return res.status(response.status).json(err);
+    }
+
+    const data = await response.json();
+    res.json(data);
+  } catch (err) {
+    console.error("Brief proxy error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
