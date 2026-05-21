@@ -3,6 +3,7 @@ const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
 const zlib = require("zlib");
+const inboxMonitor = require("./lib/inbox-monitor");
 
 const app = express();
 app.use(cors());
@@ -12,6 +13,7 @@ const DATA_FILE = path.join(__dirname, "reports.json");
 const PORT = process.env.PORT || 3001;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "change-this-secret";
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const OUTLOOK_CLIENT_ID = process.env.OUTLOOK_CLIENT_ID;
 
 function loadReports() {
   if (!fs.existsSync(DATA_FILE)) return [];
@@ -266,4 +268,23 @@ app.post("/api/brief", async (req, res) => {
     console.error("Brief proxy error:", err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+app.get("/api/monitor/status", (req, res) => {
+  const state = inboxMonitor.loadState();
+  res.json({
+    enabled: process.env.MONITOR_ENABLED === "true",
+    startedAt: state.startedAt,
+    lastPollIso: state.lastPollIso || null,
+    selfAddress: state.selfAddress || null,
+    processedCount: (state.processedIds || []).length,
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`[server] listening on :${PORT}`);
+  inboxMonitor.start({
+    clientId: OUTLOOK_CLIENT_ID,
+    anthropicKey: ANTHROPIC_API_KEY,
+  });
 });

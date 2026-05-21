@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.local
+*.log
+
+# Inbox monitor — sensitive state, never commit
+.outlook-token.json
+monitor-state.json
+
+# Existing data file
+reports.json
